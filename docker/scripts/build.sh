@@ -101,7 +101,7 @@ if [ ! -z "${BUILD_USER_DOCS}" ]; then
   cp docker/resources/groovy/grapeConfig.xml ~/.groovy/
   rm -rf /tmp/neo4j
   grep -l 'http://tinkerpop.apache.org/docs/x.y.z' $(find docs/src -name "*.asciidoc" | grep -v '^.docs/src/upgrade/') | xargs sed -i 's@http://tinkerpop.apache.org/docs/x.y.z@/docs/x.y.z@g'
-  bin/process-docs.sh || exit 1
+  bin/process-docs.sh -f docs/src/recipes/anti-patterns.asciidoc || exit 1
 
   # emulate published directory structure
   VERSION=$(cat pom.xml | grep -A1 '<artifactId>tinkerpop</artifactId>' | grep '<version>' | awk -F '>' '{print $2}' | awk -F '<' '{print $1}')
