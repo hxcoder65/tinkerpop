@@ -42,14 +42,6 @@ public class GraphSONTypeIdResolver implements TypeIdResolver {
 
     private final Map<Class, String> typeToId = new HashMap<>();
 
-    public Map<String, JavaType> getIdToType() {
-        return idToType;
-    }
-
-    public Map<Class, String> getTypeToId() {
-        return typeToId;
-    }
-
     // Override manually a type definition.
     public GraphSONTypeIdResolver addCustomType(final String name, final Class clasz) {
         if (Tree.class.isAssignableFrom(clasz)) {
@@ -63,6 +55,14 @@ public class GraphSONTypeIdResolver implements TypeIdResolver {
         }
         typeToId.put(clasz, name);
         return this;
+    }
+
+    public final Map<String, JavaType> getIdToType() {
+        return idToType;
+    }
+
+    public final Map<Class, String> getTypeToId() {
+        return typeToId;
     }
 
     @Override
@@ -102,7 +102,6 @@ public class GraphSONTypeIdResolver implements TypeIdResolver {
 
     @Override
     public String getDescForKnownTypeIds() {
-        // TODO: Not sure what to put here.
         return "GraphSON advanced typing system";
     }
 
