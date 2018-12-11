@@ -22,17 +22,26 @@
 #endregion
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net.WebSockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
+using Gremlin.Net.Driver.Exceptions;
 using Gremlin.Net.Driver.Messages;
-using Gremlin.Net.Driver.ResultsAggregation;
 using Gremlin.Net.Structure.IO.GraphSON;
 using Newtonsoft.Json.Linq;
 
 namespace Gremlin.Net.Driver
 {
+    internal interface IResponseHandlerForSingleRequestMessage
+    {
+        void HandleReceived(ResponseMessage<JToken> received);
+        void Finalize(Dictionary<string, object> statusAttributes);
+        void HandleFailure(Exception objException);
+    }
+
     internal class Connection : IConnection
     {
         private readonly GraphSONReader _graphSONReader;
@@ -42,6 +51,13 @@ namespace Gremlin.Net.Driver
         private readonly WebSocketConnection _webSocketConnection;
         private readonly string _username;
         private readonly string _password;
+        private readonly ConcurrentQueue<RequestMessage> _writeQueue = new ConcurrentQueue<RequestMessage>();
+
+        private readonly ConcurrentDictionary<Guid, IResponseHandlerForSingleRequestMessage> _callbackByRequestId =
+            new ConcurrentDictionary<Guid, IResponseHandlerForSingleRequestMessage>();
+        private int _connectionState = 0;
+        private int _writeInProgress = 0;
+        private const int Closed = 1;
 
         public Connection(Uri uri, string username, string password, GraphSONReader graphSONReader,
             GraphSONWriter graphSONWriter, string mimeType, Action<ClientWebSocketOptions> webSocketConfiguration)
@@ -55,96 +71,82 @@ namespace Gremlin.Net.Driver
             _webSocketConnection = new WebSocketConnection(webSocketConfiguration);
         }
 
-        public async Task<ResultSet<T>> SubmitAsync<T>(RequestMessage requestMessage)
-        {
-            await SendAsync(requestMessage).ConfigureAwait(false);
-            return await ReceiveAsync<T>().ConfigureAwait(false);
-        }
-
         public async Task ConnectAsync()
         {
             await _webSocketConnection.ConnectAsync(_uri).ConfigureAwait(false);
+            ReceiveNext();
         }
 
-        public async Task CloseAsync()
-        {
-            await _webSocketConnection.CloseAsync().ConfigureAwait(false);
-        }
+        public int NrRequestsInFlight => _callbackByRequestId.Count;
 
         public bool IsOpen => _webSocketConnection.IsOpen;
 
-        private async Task SendAsync(RequestMessage message)
+        public Task<ResultSet<T>> SubmitAsync<T>(RequestMessage requestMessage)
         {
-            var graphsonMsg = _graphSONWriter.WriteObject(message);
-            var serializedMsg = _messageSerializer.SerializeMessage(graphsonMsg);
-            await _webSocketConnection.SendMessageAsync(serializedMsg).ConfigureAwait(false);
+            var receiver = new ResponseHandlerForSingleRequestMessage<T>(_graphSONReader);
+            _callbackByRequestId.GetOrAdd(requestMessage.RequestId, receiver);
+            _writeQueue.Enqueue(requestMessage);
+            SendNextMessage();
+            return receiver.Result;
         }
 
-        private async Task<ResultSet<T>> ReceiveAsync<T>()
+        private void ReceiveNext()
         {
-            ResultSet<T> resultSet = null;
-            Dictionary<string, object> statusAttributes = null;
-            ResponseStatus status;
-            IAggregator aggregator = null;
-            var isAggregatingSideEffects = false;
-            var result = new List<T>();
-            do
+            var state = Interlocked.CompareExchange(ref _connectionState, 0, 0);
+            if (state == Closed) return;
+            _webSocketConnection.ReceiveMessageAsync().ContinueWith(
+                received =>
+                {
+                    Parse(received.Result);
+                    ReceiveNext();
+                },
+                TaskContinuationOptions.ExecuteSynchronously);
+        }
+
+        private void Parse(byte[] received)
+        {
+            var receivedMsg = _messageSerializer.DeserializeMessage<ResponseMessage<JToken>>(received);
+
+            var status = receivedMsg.Status;
+            if (status.Code.IndicatesError())
             {
-                var received = await _webSocketConnection.ReceiveMessageAsync().ConfigureAwait(false);
-                var receivedMsg = _messageSerializer.DeserializeMessage<ResponseMessage<JToken>>(received);
+                _callbackByRequestId[receivedMsg.RequestId].HandleFailure(new ResponseException(status.Code,
+                    status.Attributes, $"{status.Code}: {status.Message}"));
+                _callbackByRequestId.TryRemove(receivedMsg.RequestId, out _);
+                return;
+            }
 
-                status = receivedMsg.Status;
-                status.ThrowIfStatusIndicatesError();
+            if (status.Code == ResponseStatusCode.Authenticate)
+            {
+                Authenticate(receivedMsg.RequestId);
+                return;
+            }
 
-                if (status.Code == ResponseStatusCode.Authenticate)
-                {
-                    await AuthenticateAsync().ConfigureAwait(false);
-                }
-                else if (status.Code != ResponseStatusCode.NoContent)
-                {
-                    var receivedData = typeof(T) == typeof(JToken)
-                        ? new[] { receivedMsg.Result.Data }
-                        : _graphSONReader.ToObject(receivedMsg.Result.Data);
+            if (status.Code != ResponseStatusCode.NoContent)
+                _callbackByRequestId[receivedMsg.RequestId].HandleReceived(receivedMsg);
 
-                    foreach (var d in receivedData)
-                        if (receivedMsg.Result.Meta.ContainsKey(Tokens.ArgsSideEffectKey))
-                        {
-                            if (aggregator == null)
-                                aggregator =
-                                    new AggregatorFactory().GetAggregatorFor(
-                                        (string) receivedMsg.Result.Meta[Tokens.ArgsAggregateTo]);
-                            aggregator.Add(d);
-                            isAggregatingSideEffects = true;
-                        }
-                        else
-                        {
-                            result.Add(d);
-                        }
-                }
-
-                if (status.Code == ResponseStatusCode.Success || status.Code == ResponseStatusCode.NoContent)
-                {
-                    statusAttributes = receivedMsg.Status.Attributes;
-                }
-
-            } while (status.Code == ResponseStatusCode.PartialContent || status.Code == ResponseStatusCode.Authenticate);
-
-
-            resultSet = new ResultSet<T>(isAggregatingSideEffects ? new List<T> { (T)aggregator.GetAggregatedResult() } : result, statusAttributes);
-                
-            return resultSet;
+            if (status.Code == ResponseStatusCode.Success || status.Code == ResponseStatusCode.NoContent)
+            {
+                _callbackByRequestId[receivedMsg.RequestId].Finalize(status.Attributes);
+                _callbackByRequestId.TryRemove(receivedMsg.RequestId, out _);
+            }
         }
-
-        private async Task AuthenticateAsync()
+        
+        private void Authenticate(Guid requestId)
         {
             if (string.IsNullOrEmpty(_username) || string.IsNullOrEmpty(_password))
-                throw new InvalidOperationException(
-                    $"The Gremlin Server requires authentication, but no credentials are specified - username: {_username}, password: {_password}.");
+            {
+                _callbackByRequestId[requestId].HandleFailure(new InvalidOperationException(
+                    $"The Gremlin Server requires authentication, but no credentials are specified - username: {_username}, password: {_password}."));
+                _callbackByRequestId.TryRemove(requestId, out _);
+                return;
+            }
 
             var message = RequestMessage.Build(Tokens.OpsAuthentication).Processor(Tokens.ProcessorTraversal)
                 .AddArgument(Tokens.ArgsSasl, SaslArgument()).Create();
 
-            await SendAsync(message).ConfigureAwait(false);
+            _writeQueue.Enqueue(message);
+            SendNextMessage();
         }
 
         private string SaslArgument()
@@ -152,6 +154,38 @@ namespace Gremlin.Net.Driver
             var auth = $"\0{_username}\0{_password}";
             var authBytes = Encoding.UTF8.GetBytes(auth);
             return Convert.ToBase64String(authBytes);
+        }
+
+        private void SendNextMessage()
+        {
+            if (Interlocked.CompareExchange(ref _writeInProgress, 1, 0) != 0)
+                return;
+            if (_writeQueue.TryDequeue(out var msg))
+                SendMessageAsync(msg).ContinueWith(
+                    t =>
+                    {
+                        if (t.IsFaulted)
+                        {
+                            _callbackByRequestId[msg.RequestId].HandleFailure(t.Exception);
+                            _callbackByRequestId.TryRemove(msg.RequestId, out _);
+                        }
+
+                        SendNextMessage();
+                    }, TaskContinuationOptions.ExecuteSynchronously);
+            Interlocked.CompareExchange(ref _writeInProgress, 0, 1);
+        }
+        
+        private async Task SendMessageAsync(RequestMessage message)
+        {
+            var graphsonMsg = _graphSONWriter.WriteObject(message);
+            var serializedMsg = _messageSerializer.SerializeMessage(graphsonMsg);
+            await _webSocketConnection.SendMessageAsync(serializedMsg).ConfigureAwait(false);
+        }
+
+        public async Task CloseAsync()
+        {
+            Interlocked.Exchange(ref _connectionState, Closed);
+            await _webSocketConnection.CloseAsync().ConfigureAwait(false);
         }
 
         #region IDisposable Support

@@ -23,8 +23,10 @@
 
 using System;
 using System.Collections.Concurrent;
-using System.Linq;
+using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
+using Gremlin.Net.Driver.Exceptions;
 using Gremlin.Net.Process;
 
 namespace Gremlin.Net.Driver
@@ -33,91 +35,131 @@ namespace Gremlin.Net.Driver
     {
         private readonly ConnectionFactory _connectionFactory;
         private readonly ConcurrentBag<Connection> _connections = new ConcurrentBag<Connection>();
-        private readonly object _connectionsLock = new object();
+        private readonly int _minPoolSize;
+        private readonly int _maxPoolSize;
+        private readonly int _maxInProcessPerConnection;
+        private int _nrConnections;
 
-        public ConnectionPool(ConnectionFactory connectionFactory)
+        public ConnectionPool(ConnectionFactory connectionFactory, ConnectionPoolSettings settings)
         {
             _connectionFactory = connectionFactory;
+            _minPoolSize = settings.MinSize;
+            _maxPoolSize = settings.MaxSize;
+            _maxInProcessPerConnection = settings.MaxInProcessPerConnection;
+            PopulatePoolAsync().WaitUnwrap();
         }
 
-        public int NrConnections { get; private set; }
+        public int NrConnections => Interlocked.CompareExchange(ref _nrConnections, 0, 0);
+
+        private async Task PopulatePoolAsync()
+        {
+            var connectionCreationTasks = new List<Task<Connection>>(_minPoolSize);
+            for (var i = 0; i < _minPoolSize; i++)
+            {
+                connectionCreationTasks.Add(CreateNewConnectionAsync());
+            }
+
+            var createdConnections = await Task.WhenAll(connectionCreationTasks).ConfigureAwait(false);
+            foreach (var c in createdConnections)
+            {
+                _connections.Add(c);
+            }
+
+            Interlocked.CompareExchange(ref _nrConnections, _minPoolSize, 0);
+        }
 
         public async Task<IConnection> GetAvailableConnectionAsync()
         {
-            if (!TryGetConnectionFromPool(out var connection))
-                connection = await CreateNewConnectionAsync().ConfigureAwait(false);
+            if (TryGetConnectionFromPool(out var connection))
+                return ProxiedConnection(connection);
+            connection = await AddConnectionIfUnderMaximumAsync().ConfigureAwait(false);
+            if (connection == null)
+                throw new NoConnectionAvailableException("no connection available!");
+            return ProxiedConnection(connection);
+        }
 
-            return new ProxyConnection(connection, AddConnectionIfOpen);
+        private IConnection ProxiedConnection(Connection connection)
+        {
+            return new ProxyConnection(connection, ReturnConnectionIfOpen);
+        }
+
+        private void ReturnConnectionIfOpen(Connection connection)
+        {
+            if (connection.IsOpen) return;
+            ConsiderUnavailable();
+            DefinitelyDestroyConnection(connection);
+        }
+
+        private async Task<Connection> AddConnectionIfUnderMaximumAsync()
+        {
+            while (true)
+            {
+                var nrOpened = Interlocked.CompareExchange(ref _nrConnections, 0, 0);
+                if (nrOpened >= _maxPoolSize) return null;
+
+                if (Interlocked.CompareExchange(ref _nrConnections, nrOpened + 1, nrOpened) == nrOpened)
+                    break;
+            }
+
+            var connection = await CreateNewConnectionAsync().ConfigureAwait(false);
+            _connections.Add(connection);
+            return connection;
+        }
+
+        private async Task<Connection> CreateNewConnectionAsync()
+        {
+            var newConnection = _connectionFactory.CreateConnection();
+            await newConnection.ConnectAsync().ConfigureAwait(false);
+            return newConnection;
         }
 
         private bool TryGetConnectionFromPool(out Connection connection)
         {
             while (true)
             {
-                connection = null;
-                lock (_connectionsLock)
-                {
-                    if (_connections.IsEmpty) return false;
-                    _connections.TryTake(out connection);
-                }
-
+                connection = SelectLeastUsedConnection();
+                if (connection == null) return false; // _connections is empty
+                if (connection.NrRequestsInFlight >= _maxInProcessPerConnection)
+                    return false;
                 if (connection.IsOpen) return true;
-                connection.Dispose();
+                DefinitelyDestroyConnection(connection);
             }
         }
 
-        private async Task<Connection> CreateNewConnectionAsync()
+        private Connection SelectLeastUsedConnection()
         {
-            NrConnections++;
-            var newConnection = _connectionFactory.CreateConnection();
-            await newConnection.ConnectAsync().ConfigureAwait(false);
-            return newConnection;
-        }
-
-        private void AddConnectionIfOpen(Connection connection)
-        {
-            if (!connection.IsOpen)
+            if (_connections.IsEmpty) return null;
+            var nrMinInFlightConnections = int.MaxValue;
+            Connection leastBusy = null;
+            foreach (var connection in _connections)
             {
-                ConsiderUnavailable();
-                connection.Dispose();
-                return;
+                var nrInFlight = connection.NrRequestsInFlight;
+                if (nrInFlight >= nrMinInFlightConnections) continue;
+                nrMinInFlightConnections = nrInFlight;
+                leastBusy = connection;
             }
-            AddConnection(connection);
-        }
 
-        private void AddConnection(Connection connection)
-        {
-            lock (_connectionsLock)
-            {
-                _connections.Add(connection);
-            }
+            return leastBusy;
         }
 
         private void ConsiderUnavailable()
         {
-            CloseAndRemoveAllConnections();
+            CloseAndRemoveAllConnectionsAsync().WaitUnwrap();
         }
 
-        private void CloseAndRemoveAllConnections()
-        {
-            lock (_connectionsLock)
-            {
-                TeardownAsync().WaitUnwrap();
-                RemoveAllConnections();
-            }
-        }
-
-        private void RemoveAllConnections()
+        private async Task CloseAndRemoveAllConnectionsAsync()
         {
             while (_connections.TryTake(out var connection))
             {
-                connection.Dispose();
+                await connection.CloseAsync().ConfigureAwait(false);
+                DefinitelyDestroyConnection(connection);
             }
         }
 
-        private async Task TeardownAsync()
+        private void DefinitelyDestroyConnection(Connection connection)
         {
-            await Task.WhenAll(_connections.Select(c => c.CloseAsync())).ConfigureAwait(false);
+            connection.Dispose();
+            Interlocked.Decrement(ref _nrConnections);
         }
 
         #region IDisposable Support
@@ -135,10 +177,11 @@ namespace Gremlin.Net.Driver
             if (!_disposed)
             {
                 if (disposing)
-                    CloseAndRemoveAllConnections();
+                    CloseAndRemoveAllConnectionsAsync().WaitUnwrap();
                 _disposed = true;
             }
         }
+
         #endregion
     }
 }

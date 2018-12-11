@@ -29,6 +29,18 @@ Please see the link:https://github.com/apache/tinkerpop/blob/3.4.0/CHANGELOG.asc
 
 === Upgrading for Users
 
+==== Gremlin.NET Driver Improvements
+
+The Gremlin.NET driver now uses request pipelining. This allows connections to be reused for different requests in parallel which should lead to better utilization of connections.
+The `ConnectionPool` now also has a min and max size. A new connection is only created if all existing connections reached their `MaxInProcessPerConnection` limit. If additionally
+the max size of the `ConnectionPool` is reached, then a `NoConnectionAvailableException` is thrown which makes this a breaking change.
+
+These settings can be set as properties on the `ConnectionPoolSettings` instance that can be passed to the `GremlinClient`.
+
+See: link:https://issues.apache.org/jira/browse/TINKERPOP-1774[TINKERPOP-1774],
+link:https://issues.apache.org/jira/browse/TINKERPOP-1775[TINKERPOP-1775],
+link:http://tinkerpop.apache.org/docs/3.4.0/reference/#_connection_pool[Reference Documentation]
+
 ==== Modulation of valueMap()
 
 The `valueMap()` step now supports `by` and `with` modulation, which also led to the deprecation of `valueMap(true)` overloads.

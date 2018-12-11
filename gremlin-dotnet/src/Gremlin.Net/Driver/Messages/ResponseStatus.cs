@@ -22,7 +22,6 @@
 #endregion
 
 using System.Collections.Generic;
-using Gremlin.Net.Driver.Exceptions;
 using Newtonsoft.Json;
 
 namespace Gremlin.Net.Driver.Messages
@@ -37,14 +36,5 @@ namespace Gremlin.Net.Driver.Messages
 
         [JsonProperty(PropertyName = "message")]
         public string Message { get; set; }
-    }
-
-    internal static class ResponseStatusExtensions
-    {
-        public static void ThrowIfStatusIndicatesError(this ResponseStatus status)
-        {
-            if (status.Code.IndicatesError())
-                throw new ResponseException(status.Code, status.Attributes, $"{status.Code}: {status.Message}");
-        }
     }
 }

@@ -1008,6 +1008,22 @@ The connection properties for the Gremlin.Net driver can be passed to the `Greml
 |password |The password to submit on requests that require authentication. |_none_
 |=========================================================
 
+==== Connection Pool
+
+It is also possible to configure the `ConnectionPool` of the Gremlin.Net driver.
+These configuration options can be set as properties
+on the `ConnectionPoolSettings` instance that can be passed to the `GremlinClient`:
+
+[width="100%",cols="3,10,^2",options="header"]
+|=========================================================
+|Key |Description |Default
+|MinSize |The minimum size of the connection pool. This determines how many connections are initially created. |2
+|MaxSize |The maximum size of the connection pool. |32
+|MaxInProcessPerConnection |The maximum number of in-flight requests that can occur on a connection. |4
+|=========================================================
+
+A `NoConnectionAvailableException` is thrown if the `ConnectionPool` reaches the `MaxSize` limit and all connections have reached the `MaxInProcessPerConnection` limit when a new request comes in.
+
 ==== Serialization
 
 The Gremlin.Net driver uses by default GraphSON 3.0 but it is also possible to use GraphSON 2.0 which can be necessary
